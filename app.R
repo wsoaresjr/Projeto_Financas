@@ -3,11 +3,13 @@ library(shiny)
 library(DBI)
 library(RMySQL)
 library(DT)
+library(dplyr)
 library(dotenv)
 
-# Arquivo .env
+# Carregar variáveis de ambiente
 load_dot_env(file = "config.env")
 
+# Conexão única ao banco de dados
 tryCatch({
   con <- dbConnect(
     RMySQL::MySQL(),
@@ -23,6 +25,18 @@ tryCatch({
 
 # UI
 ui <- fluidPage(
+  tags$script(HTML("
+    $(document).on('click', '.edit_btn', function() {
+      var id = $(this).data('id');
+      Shiny.setInputValue('edit_category', id, {priority: 'event'});
+    });
+
+    $(document).on('click', '.delete_btn', function() {
+      var id = $(this).data('id');
+      Shiny.setInputValue('delete_category', id, {priority: 'event'});
+    });
+  ")),
+  
   titlePanel("Gerenciador Financeiro"),
   
   tabsetPanel(
@@ -35,69 +49,28 @@ ui <- fluidPage(
                mainPanel(
                  dataTableOutput("categories_table")
                )
-             )),
-    tabPanel("Transações",
-             sidebarLayout(
-               sidebarPanel(
-                 textInput("description", "Descrição"),
-                 numericInput("amount", "Valor", value = 0),
-                 dateInput("transaction_date", "Data", value = Sys.Date()),
-                 selectInput("category", "Categoria", choices = NULL),
-                 selectInput("account_type", "Tipo de Conta", choices = c("Pessoa Física", "Pessoa Jurídica")),
-                 fileInput("receipt", "Comprovante (opcional)"),
-                 actionButton("add_transaction", "Adicionar Transação")
-               ),
-               mainPanel(
-                 dataTableOutput("transactions_table")
-               )
-             )),
-    tabPanel("Agendamentos",
-             sidebarLayout(
-               sidebarPanel(
-                 textInput("schedule_description", "Descrição"),
-                 numericInput("schedule_amount", "Valor", value = 0),
-                 dateInput("due_date", "Data de Vencimento", value = Sys.Date()),
-                 selectInput("schedule_category", "Categoria", choices = NULL),
-                 selectInput("schedule_account_type", "Tipo de Conta", choices = c("Pessoa Física", "Pessoa Jurídica")),
-                 actionButton("add_schedule", "Agendar")
-               ),
-               mainPanel(
-                 dataTableOutput("schedules_table")
-               )
-             )),
-    tabPanel("Relatórios",
-             sidebarLayout(
-               sidebarPanel(
-                 dateRangeInput("report_range", "Período", start = Sys.Date() - 30, end = Sys.Date()),
-                 actionButton("generate_report", "Gerar Relatório")
-               ),
-               mainPanel(
-                 plotOutput("report_plot"),
-                 dataTableOutput("report_table")
-               )
              ))
   )
 )
 
 # Server
 server <- function(input, output, session) {
-  # Reactive values
+  # Reactive value para categorias
   categories_data <- reactiveVal(dbGetQuery(con, "SELECT * FROM categories"))
-  transactions_data <- reactiveVal(dbGetQuery(con, "SELECT * FROM transactions"))
-  schedules_data <- reactiveVal(dbGetQuery(con, "SELECT * FROM scheduled_payments"))
-  account_types <- reactiveVal(dbGetQuery(con, "SELECT * FROM account_types"))
   
-  # Atualizar tipos de conta
-  observe({
-    updateSelectInput(session, "account_type", choices = account_types()$type_name)
-  })
-  
-  
-  # Atualizar categorias
-  observe({
-    updateSelectInput(session, "category", choices = categories_data()$name)
-    updateSelectInput(session, "schedule_category", choices = categories_data()$name)
-  })
+  # Atualizar tabela de categorias
+  output$categories_table <- renderDataTable({
+    datatable(
+      categories_data() %>%
+        mutate(
+          Editar = sprintf('<button class="btn btn-primary btn-sm edit_btn" data-id="%d">Editar</button>', id),
+          Deletar = sprintf('<button class="btn btn-danger btn-sm delete_btn" data-id="%d">Deletar</button>', id)
+        ),
+      escape = FALSE,
+      options = list(pageLength = 5),
+      rownames = FALSE
+    )
+  }, server = FALSE)
   
   # Adicionar Categoria
   observeEvent(input$add_category, {
@@ -105,54 +78,67 @@ server <- function(input, output, session) {
     query <- sprintf("INSERT INTO categories (name) VALUES ('%s')", dbEscapeStrings(con, input$new_category))
     dbExecute(con, query)
     categories_data(dbGetQuery(con, "SELECT * FROM categories"))
+    
+    # Limpar a caixa de texto
+    updateTextInput(session, "new_category", value = "")
+    
     showNotification("Categoria adicionada com sucesso!", type = "message")
   })
   
-  output$categories_table <- renderDataTable({
-    datatable(categories_data(), options = list(pageLength = 5))
+  # Editar Categoria
+  observeEvent(input$edit_category, {
+    selected_id <- input$edit_category
+    selected_category <- categories_data() %>% filter(id == selected_id)
+    
+    showModal(modalDialog(
+      title = "Editar Categoria",
+      textInput("edit_category_name", "Novo Nome", value = selected_category$name),
+      footer = tagList(
+        modalButton("Cancelar"),
+        actionButton("save_edit_category", "Salvar", class = "btn btn-success")
+      )
+    ))
   })
   
-  # Adicionar Transação
-  observeEvent(input$add_transaction, {
-    req(input$description, input$amount, input$transaction_date, input$category, input$account_type)
-    category_id <- dbGetQuery(con, sprintf("SELECT id FROM categories WHERE name = '%s'", input$category))$id[1]
-    account_type_id <- ifelse(input$account_type == "Pessoa Física", 1, 2)
-    query <- sprintf(
-      "INSERT INTO transactions (amount, description, transaction_date, category_id, account_type_id) VALUES (%f, '%s', '%s', %d, %d)",
-      input$amount, input$description, input$transaction_date, category_id, account_type_id
-    )
+  observeEvent(input$save_edit_category, {
+    req(input$edit_category_name, input$edit_category)
+    query <- sprintf("UPDATE categories SET name = '%s' WHERE id = %d", dbEscapeStrings(con, input$edit_category_name), input$edit_category)
     dbExecute(con, query)
-    transactions_data(dbGetQuery(con, "SELECT * FROM transactions"))
-    showNotification("Transação adicionada com sucesso!", type = "message")
+    categories_data(dbGetQuery(con, "SELECT * FROM categories"))
+    removeModal()
+    showNotification("Categoria editada com sucesso!", type = "message")
   })
   
-  output$transactions_table <- renderDataTable({
-    datatable(transactions_data(), options = list(pageLength = 5))
+  # Deletar Categoria
+  observeEvent(input$delete_category, {
+    selected_id <- input$delete_category
+    selected_category <- categories_data() %>% filter(id == selected_id)
+    
+    showModal(modalDialog(
+      title = "Deletar Categoria",
+      paste0("Tem certeza de que deseja deletar a categoria: ", selected_category$name, "?"),
+      footer = tagList(
+        modalButton("Cancelar"),
+        actionButton("confirm_delete_category", "Deletar", class = "btn btn-danger")
+      )
+    ))
   })
   
-  # Agendar Pagamento
-  observeEvent(input$add_schedule, {
-    req(input$schedule_description, input$schedule_amount, input$due_date, input$schedule_category, input$schedule_account_type)
-    schedule_category_id <- dbGetQuery(con, sprintf("SELECT id FROM categories WHERE name = '%s'", input$schedule_category))$id[1]
-    schedule_account_type_id <- ifelse(input$schedule_account_type == "Pessoa Física", 1, 2)
-    query <- sprintf(
-      "INSERT INTO scheduled_payments (amount, description, due_date, category_id, account_type_id) VALUES (%f, '%s', '%s', %d, %d)",
-      input$schedule_amount, input$schedule_description, input$due_date, schedule_category_id, schedule_account_type_id
-    )
+  observeEvent(input$confirm_delete_category, {
+    req(input$delete_category)
+    query <- sprintf("DELETE FROM categories WHERE id = %d", input$delete_category)
     dbExecute(con, query)
-    schedules_data(dbGetQuery(con, "SELECT * FROM scheduled_payments"))
-    showNotification("Agendamento adicionado com sucesso!", type = "message")
-  })
-  
-  output$schedules_table <- renderDataTable({
-    datatable(schedules_data(), options = list(pageLength = 5))
-  })
-  
-  # Relatórios (Placeholder)
-  observeEvent(input$generate_report, {
-    showNotification("Relatórios serão implementados em breve!", type = "warning")
+    categories_data(dbGetQuery(con, "SELECT * FROM categories"))
+    removeModal()
+    showNotification("Categoria deletada com sucesso!", type = "message")
   })
 }
+
+# Fechar a conexão ao encerrar o aplicativo
+onStop(function() {
+  dbDisconnect(con)
+  message("Conexão ao banco de dados encerrada.")
+})
 
 # Executa o app
 shinyApp(ui = ui, server = server)
